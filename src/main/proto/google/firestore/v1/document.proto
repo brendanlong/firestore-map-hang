@@ -1,0 +1,33 @@
+// Subset of the Firestore document.proto, containing only the types relevant
+// to the protobuf equals() performance issue.
+// Source: firebase-android-sdk/firebase-firestore/src/proto/google/firestore/v1/document.proto
+
+syntax = "proto3";
+
+package google.firestore.v1;
+
+option java_multiple_files = true;
+option java_package = "com.google.firestore.v1";
+
+// A message that can hold any of the supported value types.
+// (Simplified from the full Firestore proto -- only the types we need for the repro)
+message Value {
+  oneof value_type {
+    bool boolean_value = 1;
+    int64 integer_value = 2;
+    double double_value = 3;
+    string string_value = 17;
+    ArrayValue array_value = 9;
+    MapValue map_value = 6;
+  }
+}
+
+// An array value.
+message ArrayValue {
+  repeated Value values = 1;
+}
+
+// A map value.
+message MapValue {
+  map<string, Value> fields = 1;
+}
