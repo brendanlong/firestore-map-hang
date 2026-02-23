@@ -180,5 +180,5 @@ recursion, zero reflection, zero `MapFieldLite`.
   "Firestore realtime query stops working after few updates"
 - [firebase/firebase-android-sdk#1920](https://github.com/firebase/firebase-android-sdk/pull/1920) --
   "Remove usages of Protobuf equals" (partial fix)
-- [protobuf#19670](https://github.com/protocolbuffers/protobuf/issues/19670) --
-  protobuf-javalite `MessageSchema.equals()` exponential for `oneof` with nested messages
+- [brendanlong/protobuf#1](https://github.com/brendanlong/protobuf/issues/1) --
+  `MessageSchema.equals()` is O(V^N) for messages with `oneof` fields containing nested messages
