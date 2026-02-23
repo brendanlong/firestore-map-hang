@@ -91,6 +91,39 @@ public class FirestoreMapHangRepro {
             );
         }
 
+        // ---- Part 1b: Same configs but ONLY the nested map field (no flat fields) ----
+        System.out.println();
+        System.out.println("--- Part 1b: Map-only document (just the instructionSections field) ---");
+        System.out.println();
+
+        for (int[] cfg : configs) {
+            int sc = cfg[0], sps = cfg[1], ips = cfg[2];
+            Value mapOnly = buildMapOnlyDocument(sc, sps, ips);
+            Value mapOnlyCopy = buildMapOnlyDocument(sc, sps, ips);
+            int totalFields = countFields(mapOnly);
+
+            long mapStart = System.nanoTime();
+            boolean eq = mapOnly.equals(mapOnlyCopy);
+            long elapsedNs = System.nanoTime() - mapStart;
+            double elapsedMs = elapsedNs / 1_000_000.0;
+
+            if (!eq) {
+                throw new AssertionError("Documents should be equal");
+            }
+
+            String severity;
+            if (elapsedMs > 10_000) severity = " *** HANG (>10s) ***";
+            else if (elapsedMs > 1_000) severity = " *** VERY SLOW (>1s) ***";
+            else if (elapsedMs > 100) severity = " * slow (>100ms) *";
+            else if (elapsedMs > 16) severity = " * noticeable (>16ms) *";
+            else severity = "";
+
+            System.out.printf(
+                "sections=%d steps=%d ingredients=%d | fields=%4d | equals(): %10.1f ms%s%n",
+                sc, sps, ips, totalFields, elapsedMs, severity
+            );
+        }
+
         // ---- Part 2: Flat fields only (baseline) ----
         System.out.println();
         System.out.println("--- Part 2: Baseline -- flat fields only (no nested maps) ---");
@@ -195,6 +228,19 @@ public class FirestoreMapHangRepro {
         }
         doc.putFields("instructionSections", Value.newBuilder().setArrayValue(sections).build());
 
+        return Value.newBuilder().setMapValue(doc).build();
+    }
+
+    /** Build a document with ONLY the instructionSections field (no flat scalar fields). */
+    static Value buildMapOnlyDocument(int numSections, int stepsPerSection, int ingredientsPerStep) {
+        MapValue.Builder doc = MapValue.newBuilder();
+        ArrayValue.Builder sections = ArrayValue.newBuilder();
+        for (int s = 0; s < numSections; s++) {
+            sections.addValues(Value.newBuilder()
+                .setMapValue(buildInstructionSection("Section " + (s + 1), stepsPerSection, ingredientsPerStep))
+                .build());
+        }
+        doc.putFields("instructionSections", Value.newBuilder().setArrayValue(sections).build());
         return Value.newBuilder().setMapValue(doc).build();
     }
 
