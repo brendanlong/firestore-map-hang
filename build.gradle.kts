@@ -5,7 +5,7 @@ plugins {
 }
 
 application {
-    mainClass.set("com.example.firestorehang.FirestoreMapHangRepro")
+    mainClass.set(System.getProperty("mainClass") ?: "com.example.firestorehang.FirestoreMapHangRepro")
 }
 
 repositories {

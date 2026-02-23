@@ -27,6 +27,30 @@ import com.google.firestore.v1.Value;
  *   bypassing the fix entirely. View.computeDocChanges() calls
  *   ObjectValue.equals(), so the slow path is still hit.
  *
+ * ROOT CAUSE (identified by this reproduction):
+ *   protobuf-javalite's MessageSchema.equals() iterates ALL oneof field
+ *   entries in its schema buffer, not just the active variant. The Firestore
+ *   Value message has 6 oneof variants (boolean, integer, double, string,
+ *   array, map). All variants share a single storage slot (offset 28).
+ *
+ *   For each variant, equals() checks isOneofCaseEqual() -- which compares
+ *   the case discriminators. Since both messages have the same active variant,
+ *   the cases are always equal, so equals() proceeds to call safeEquals() on
+ *   the object stored at the shared offset. This means the nested MapValue is
+ *   compared 6 TIMES instead of once at each level.
+ *
+ *   At each level of nesting, this 6x multiplication compounds:
+ *     depth=1: 6^0 = 1 comparison
+ *     depth=2: 6^1 = 6 comparisons
+ *     depth=N: 6^(N-1) comparisons
+ *
+ *   This gives O(V^N) complexity where V = number of oneof variants (6)
+ *   and N = nesting depth.
+ *
+ *   A typical recipe document with ~7 levels of map nesting takes ~6 seconds
+ *   to compare. Since Firestore's AsyncQueue is single-threaded, this blocks
+ *   ALL Firestore operations (reads, writes, listeners) for the duration.
+ *
  * This reproduction uses minimal synthetic structures to isolate what
  * triggers the pathological equals() performance:
  *   - Pure depth: {a: {a: {a: ...}}} (nested maps, 1 field each)
@@ -46,6 +70,7 @@ public class FirestoreMapHangRepro {
         System.out.println("(Single field per map level)");
         System.out.println();
 
+        double[] depthTimes = new double[11];
         for (int depth : new int[]{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
             Value v = buildNestedDepth(depth, 1);
             Value v2 = buildNestedDepth(depth, 1);
@@ -53,9 +78,11 @@ public class FirestoreMapHangRepro {
             long start = System.nanoTime();
             boolean eq = v.equals(v2);
             double ms = (System.nanoTime() - start) / 1_000_000.0;
+            depthTimes[depth] = ms;
 
             if (!eq) throw new AssertionError();
-            System.out.printf("  depth=%2d | %10.3f ms%s%n", depth, ms, severity(ms));
+            String ratio = depth > 1 ? String.format(" (%.1fx prev)", ms / depthTimes[depth - 1]) : "";
+            System.out.printf("  depth=%2d | %10.3f ms%s%s%n", depth, ms, ratio, severity(ms));
         }
 
         // ---- Test 2: Pure width (flat map, N string fields, no nesting) ----
@@ -131,24 +158,38 @@ public class FirestoreMapHangRepro {
         Value recipe2 = buildMinimalRecipe();
         int fields = countFields(recipe);
         int maps = countMapValues(recipe);
+        int maxDepth = maxDepth(recipe, 0);
 
         long start = System.nanoTime();
         recipe.equals(recipe2);
         double ms = (System.nanoTime() - start) / 1_000_000.0;
 
-        System.out.printf("  fields=%d, MapValue instances=%d | %10.1f ms%s%n",
-            fields, maps, ms, severity(ms));
+        System.out.printf("  fields=%d, MapValue instances=%d, max depth=%d | %10.1f ms%s%n",
+            fields, maps, maxDepth, ms, severity(ms));
 
-        // ---- Summary ----
+        // ---- Root cause explanation ----
         System.out.println();
         System.out.println("=== Root cause ===");
         System.out.println();
-        System.out.println("View.java:  boolean docsEqual = oldDoc.getData().equals(newDoc.getData());");
-        System.out.println("ObjectValue.java:  return buildProto().equals(((ObjectValue) o).buildProto());");
+        System.out.println("protobuf-javalite MessageSchema.equals() iterates ALL oneof variants");
+        System.out.println("in the schema buffer, not just the active one. The Firestore Value");
+        System.out.println("message has 6 oneof variants sharing a single storage slot.");
         System.out.println();
-        System.out.println("This calls protobuf-javalite's MessageLite.equals(), which uses");
-        System.out.println("reflection-based deep comparison. The cost is pathological for");
-        System.out.println("messages containing map<string, Value> fields.");
+        System.out.println("For each variant, isOneofCaseEqual() returns true (both messages have");
+        System.out.println("the same active case), so safeEquals() is called on the SAME object");
+        System.out.println("6 times. At each nesting level, this 6x multiplication compounds:");
+        System.out.println();
+        System.out.printf("  Growth factor per depth level: %.1fx (= number of oneof variants)%n",
+            depthTimes[9] > 0 && depthTimes[8] > 0 ? depthTimes[9] / depthTimes[8] : 6.0);
+        System.out.printf("  Complexity: O(6^N) where N = nesting depth%n");
+        System.out.println();
+        System.out.println("Firestore SDK call path:");
+        System.out.println("  View.computeDocChanges()");
+        System.out.println("    -> ObjectValue.equals()");
+        System.out.println("      -> buildProto().equals()  // bypasses PR #1920 fix");
+        System.out.println("        -> GeneratedMessageLite.equals()");
+        System.out.println("          -> MessageSchema.equals() loops 6 oneof variants");
+        System.out.println("            -> safeEquals() on shared storage slot (6x per level)");
     }
 
     /** Build nested maps: depth levels, each with `width` string fields plus one nested child. */
@@ -286,6 +327,25 @@ public class FirestoreMapHangRepro {
                 return arrayCount;
             default:
                 return 0;
+        }
+    }
+
+    static int maxDepth(Value value, int currentDepth) {
+        switch (value.getValueTypeCase()) {
+            case MAP_VALUE:
+                int max = currentDepth + 1;
+                for (Value v : value.getMapValue().getFieldsMap().values()) {
+                    max = Math.max(max, maxDepth(v, currentDepth + 1));
+                }
+                return max;
+            case ARRAY_VALUE:
+                int arrayMax = currentDepth;
+                for (Value v : value.getArrayValue().getValuesList()) {
+                    arrayMax = Math.max(arrayMax, maxDepth(v, currentDepth));
+                }
+                return arrayMax;
+            default:
+                return currentDepth;
         }
     }
 

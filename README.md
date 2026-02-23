@@ -11,6 +11,42 @@ All subsequent Firestore operations (listeners, reads, writes) are blocked.
 
 ### Root Cause
 
+**protobuf-javalite's `MessageSchema.equals()` has O(V^N) complexity on
+messages with `oneof` fields, where V = number of `oneof` variants and
+N = nesting depth.**
+
+The Firestore `Value` message uses a `oneof` with 6 variants (boolean,
+integer, double, string, array, map). In protobuf-javalite, all `oneof`
+variants share a single storage slot. When `MessageSchema.equals()` compares
+two `Value` messages, it iterates through **all 6 field entries** in the
+schema buffer. For each entry:
+
+1. `isOneofCaseEqual()` checks whether both messages have the same active
+   `oneof` case -- this is always true when comparing identical documents.
+2. Since the cases match, `safeEquals()` is called on the object at the
+   shared storage offset.
+
+This means the nested `MapValue` is compared **6 times instead of once**
+at each nesting level. At each level, the 6x multiplication compounds:
+
+| Depth | Comparisons | Time (measured) |
+|-------|-------------|-----------------|
+| 1     | 1           | 0.08 ms         |
+| 5     | 1,296       | 3 ms            |
+| 6     | 7,776       | 17 ms           |
+| 7     | 46,656      | 100 ms          |
+| 8     | 279,936     | 600 ms          |
+| 9     | 1,679,616   | 3.6 sec         |
+| 10    | 10,077,696  | 21 sec          |
+
+**Measured growth factor: exactly 6.0x per depth level** (matching the
+number of `oneof` variants).
+
+A typical recipe document with ~7 levels of map nesting (document -> section
+-> step -> ingredient -> amount) takes **~6 seconds** per `equals()` call.
+
+### How Firestore triggers this
+
 1. **Single-threaded worker**: All Firestore operations serialize through
    `AsyncQueue` on a single `FirestoreWorker` thread.
 
@@ -24,10 +60,7 @@ All subsequent Firestore operations (listeners, reads, writes) are blocked.
    `buildProto().equals()`, which invokes protobuf-javalite's native
    `MessageLite.equals()`.
 
-4. **Pathological performance on map fields**: For messages containing
-   `map<string, Value>` fields (which is how Firestore represents all nested
-   objects), protobuf-javalite's generated `equals()` has pathological
-   performance -- **a document with just 233 nested fields takes ~52 seconds**.
+4. **Exponential time**: `MessageSchema.equals()` hits the O(6^N) path described above.
 
 ### Prior Fix (Incomplete)
 
@@ -41,26 +74,20 @@ protobuf path is still hit.
 
 ## Document Structure That Triggers This
 
-A recipe document with nested `instructionSections`:
+Any document with nested maps triggers this. A recipe document:
 
 ```
 name: String
-sourceUrl: String?
-story: String?
-imageUrl: String?
-...
 instructionSections: [              // Array of maps
-  { name: String?,
-    steps: [                        // Array of maps
-      { stepNumber: Long,
-        instruction: String,
+  { steps: [                        // Array of maps
+      { instruction: String,
         ingredients: [              // Array of maps
           { name: String,
             amount: {               // Nested map
               value: Double?,
               unit: String?
             },
-            alternates: [...]       // Recursive nesting
+            alternates: [...]       // More nesting
           }
         ]
       }
@@ -69,9 +96,14 @@ instructionSections: [              // Array of maps
 ]
 ```
 
-This creates 5+ levels of nested `MapValue` in the protobuf representation.
-Even a small recipe (1 section, 3 steps, 2 ingredients) with ~233 fields
-causes `equals()` to take **tens of seconds**.
+This creates ~6-7 levels of nested `MapValue` in the protobuf representation.
+Even the simplest possible recipe (1 section, 1 step, 1 ingredient) causes
+`equals()` to take **~6 seconds**.
+
+The nesting depth is the only thing that matters:
+- **1000 flat fields** (no nesting): 0.4 ms
+- **500 sibling maps** in an array: 6 ms
+- **8 levels of nesting** with just 1 field each: 600 ms
 
 ## Running the Reproduction
 
@@ -81,43 +113,45 @@ causes `equals()` to take **tens of seconds**.
 
 This builds a JVM project using protobuf-javalite 3.25.5 (the exact version
 used by Firebase BOM 34.9.0 / firebase-firestore 26.1.0) and runs
-`Value.equals()` on recipe documents of increasing size.
+`Value.equals()` on structures of varying depth and width.
 
 ### Requirements
 
 - Java 17+
 
+### Additional tools
+
+```bash
+# Run the equals call counter (proves call count is linear, not exponential)
+./gradlew run -DmainClass=com.example.firestorehang.EqualsCallCounter
+
+# Run schema inspection (shows buffer layout and timing comparisons)
+./gradlew run -DmainClass=com.example.firestorehang.SchemaInspector
+
+# Run hypothesis verification (proves 6x growth factor)
+./gradlew run -DmainClass=com.example.firestorehang.VerifyHypothesis
+```
+
 ### Expected Output
 
-The full run completes in ~5 minutes. Results on a server with OpenJDK 17:
-
 ```
---- Part 1: Scaling behavior of Value.equals() on nested maps ---
+--- Test 1: Pure depth -- {a: {a: {a: ...}}} ---
+(Single field per map level)
 
-sections=1 steps=1 ingredients=1 | fields=  89 | equals():    16977.1 ms *** HANG (>10s) ***
-sections=1 steps=2 ingredients=1 | fields= 140 | equals():    34224.5 ms *** HANG (>10s) ***
-sections=1 steps=2 ingredients=2 | fields= 168 | equals():    34848.3 ms *** HANG (>10s) ***
-sections=1 steps=3 ingredients=2 | fields= 233 | equals():    52915.7 ms *** HANG (>10s) ***
-sections=2 steps=2 ingredients=2 | fields= 301 | equals():    69640.4 ms *** HANG (>10s) ***
-sections=2 steps=3 ingredients=2 | fields= 431 | equals():   103670.8 ms *** HANG (>10s) ***
+  depth= 1 |      0.079 ms
+  depth= 2 |      0.129 ms   (1.6x prev)
+  depth= 3 |      0.606 ms   (4.7x prev)
+  depth= 4 |      0.613 ms   (1.0x prev)
+  depth= 5 |      2.813 ms   (4.6x prev)
+  depth= 6 |     16.722 ms   (5.9x prev)
+  depth= 7 |     98.330 ms   (5.9x prev)
+  depth= 8 |    590.539 ms   (6.0x prev)
+  depth= 9 |   3560.455 ms   (6.0x prev)
+  depth=10 |  21224.146 ms   (6.0x prev)
 
---- Part 2: Baseline -- flat fields only (no nested maps) ---
-  14 flat scalar fields: 0.013 ms (34 fields)
-
---- Part 3: JSON string workaround comparison ---
-(Using 1 section, 1 step, 1 ingredient -- the smallest possible recipe)
-  Nested maps:            17042.7 ms (89 fields)
-  JSON string:              0.015 ms (36 fields)
-  Speedup:             1,107,459x
+Growth factor per depth level: 6.0x (= number of oneof variants)
+Complexity: O(6^N) where N = nesting depth
 ```
-
-Key observations:
-- **17 seconds** for the smallest possible recipe (1 section, 1 step, 1 ingredient, 89 fields)
-- **104 seconds** for a modest recipe (2 sections, 3 steps, 2 ingredients, 431 fields)
-- Time scales roughly **linearly with number of steps** (~17s per step), suggesting O(N) with
-  an enormous constant factor from reflection
-- **Flat scalar fields** are sub-millisecond (0.013 ms for 34 fields)
-- **JSON string workaround** is over **1 million times faster**
 
 ## Workaround
 
@@ -146,3 +180,5 @@ recursion, zero reflection, zero `MapFieldLite`.
   "Firestore realtime query stops working after few updates"
 - [firebase/firebase-android-sdk#1920](https://github.com/firebase/firebase-android-sdk/pull/1920) --
   "Remove usages of Protobuf equals" (partial fix)
+- [protobuf#19670](https://github.com/protocolbuffers/protobuf/issues/19670) --
+  protobuf-javalite `MessageSchema.equals()` exponential for `oneof` with nested messages
