@@ -27,15 +27,12 @@ import com.google.firestore.v1.Value;
  *   bypassing the fix entirely. View.computeDocChanges() calls
  *   ObjectValue.equals(), so the slow path is still hit.
  *
- * This reproduction builds protobuf Value objects matching the document
- * structure that triggered the hang:
- *
- *   Recipe document with instructionSections containing:
- *     sections -> steps -> ingredients -> alternates -> amounts
- *   (5+ levels of nested MapValue)
- *
- * It then calls Value.equals() and measures the time, demonstrating that
- * even small documents with nested maps cause multi-second equality checks.
+ * This reproduction uses minimal synthetic structures to isolate what
+ * triggers the pathological equals() performance:
+ *   - Pure depth: {a: {a: {a: ...}}} (nested maps, 1 field each)
+ *   - Pure width: {a: "x", b: "x", c: "x", ...} (flat map, N fields)
+ *   - Array of maps: [{a:"x"}, {a:"x"}, ...] (N single-field maps)
+ *   - Depth x width: depth D of maps with W fields each
  */
 public class FirestoreMapHangRepro {
 
@@ -44,378 +41,216 @@ public class FirestoreMapHangRepro {
         System.out.println("protobuf-javalite version: 3.25.5 (same as Firebase BOM 34.9.0)");
         System.out.println();
 
-        // ---- Part 1: Show scaling behavior with increasing document size ----
-        System.out.println("--- Part 1: Scaling behavior of Value.equals() on nested maps ---");
+        // ---- Test 1: Pure depth (single field per level) ----
+        System.out.println("--- Test 1: Pure depth -- {a: {a: {a: ...}}} ---");
+        System.out.println("(Single field per map level)");
         System.out.println();
 
-        // Use small sizes since even tiny documents are extremely slow.
-        // NOTE: larger configs (e.g. 3 sections, 5 steps) would take 10+ minutes
-        // to complete a SINGLE equals() call, so we keep sizes small here.
-        int[][] configs = {
-            // {sections, stepsPerSection, ingredientsPerStep}
-            {1, 1, 1},   // minimal recipe
-            {1, 2, 1},   // 2 steps
-            {1, 2, 2},   // 2 steps, 2 ingredients each
-            {1, 3, 2},   // 3 steps, 2 ingredients each (small real recipe)
-            {2, 2, 2},   // 2 sections
-            {2, 3, 2},   // 2 sections, 3 steps (medium recipe)
+        for (int depth : new int[]{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+            Value v = buildNestedDepth(depth, 1);
+            Value v2 = buildNestedDepth(depth, 1);
+
+            long start = System.nanoTime();
+            boolean eq = v.equals(v2);
+            double ms = (System.nanoTime() - start) / 1_000_000.0;
+
+            if (!eq) throw new AssertionError();
+            System.out.printf("  depth=%2d | %10.3f ms%s%n", depth, ms, severity(ms));
+        }
+
+        // ---- Test 2: Pure width (flat map, N string fields, no nesting) ----
+        System.out.println();
+        System.out.println("--- Test 2: Pure width -- {a:\"x\", b:\"x\", ...} ---");
+        System.out.println("(Single flat map with N string fields, depth=1)");
+        System.out.println();
+
+        for (int width : new int[]{1, 5, 10, 20, 50, 100, 200, 500, 1000}) {
+            Value v = buildWideMap(width);
+            Value v2 = buildWideMap(width);
+
+            long start = System.nanoTime();
+            boolean eq = v.equals(v2);
+            double ms = (System.nanoTime() - start) / 1_000_000.0;
+
+            if (!eq) throw new AssertionError();
+            System.out.printf("  width=%4d | %10.3f ms%s%n", width, ms, severity(ms));
+        }
+
+        // ---- Test 3: Array of single-field maps ----
+        System.out.println();
+        System.out.println("--- Test 3: Array of maps -- [{a:\"x\"}, {a:\"x\"}, ...] ---");
+        System.out.println("(N maps in an array, each with 1 string field, depth=2)");
+        System.out.println();
+
+        for (int count : new int[]{1, 5, 10, 20, 50, 100, 200, 500}) {
+            Value v = buildArrayOfMaps(count, 1);
+            Value v2 = buildArrayOfMaps(count, 1);
+
+            long start = System.nanoTime();
+            boolean eq = v.equals(v2);
+            double ms = (System.nanoTime() - start) / 1_000_000.0;
+
+            if (!eq) throw new AssertionError();
+            System.out.printf("  count=%3d | %10.3f ms%s%n", count, ms, severity(ms));
+        }
+
+        // ---- Test 4: Depth x width ----
+        System.out.println();
+        System.out.println("--- Test 4: Depth x width -- depth D of maps with W string fields each ---");
+        System.out.println();
+
+        int[][] depthWidthConfigs = {
+            {2, 1}, {2, 2}, {2, 5}, {2, 10}, {2, 20},
+            {3, 1}, {3, 2}, {3, 5}, {3, 10},
+            {4, 1}, {4, 2}, {4, 5},
+            {5, 1}, {5, 2}, {5, 5},
+            {6, 1}, {6, 2},
+            {7, 1}, {7, 2},
+            {8, 1},
         };
 
-        for (int[] cfg : configs) {
-            int sc = cfg[0], sps = cfg[1], ips = cfg[2];
-            Value recipe = buildRecipeDocument(sc, sps, ips);
-            Value recipeCopy = buildRecipeDocument(sc, sps, ips);
-            int totalFields = countFields(recipe);
+        for (int[] cfg : depthWidthConfigs) {
+            int depth = cfg[0], width = cfg[1];
+            Value v = buildNestedDepth(depth, width);
+            Value v2 = buildNestedDepth(depth, width);
 
-            // Single measurement (no warmup -- this reflects the real-world scenario
-            // on the Firestore worker thread, which does one equals() per document change)
             long start = System.nanoTime();
-            boolean eq = recipe.equals(recipeCopy);
-            long elapsedNs = System.nanoTime() - start;
-            double elapsedMs = elapsedNs / 1_000_000.0;
+            boolean eq = v.equals(v2);
+            double ms = (System.nanoTime() - start) / 1_000_000.0;
 
-            if (!eq) {
-                throw new AssertionError("Documents should be equal");
-            }
-
-            String severity;
-            if (elapsedMs > 10_000) severity = " *** HANG (>10s) ***";
-            else if (elapsedMs > 1_000) severity = " *** VERY SLOW (>1s) ***";
-            else if (elapsedMs > 100) severity = " * slow (>100ms) *";
-            else if (elapsedMs > 16) severity = " * noticeable (>16ms) *";
-            else severity = "";
-
-            System.out.printf(
-                "sections=%d steps=%d ingredients=%d | fields=%4d | equals(): %10.1f ms%s%n",
-                sc, sps, ips, totalFields, elapsedMs, severity
-            );
+            if (!eq) throw new AssertionError();
+            System.out.printf("  depth=%2d width=%2d | %10.3f ms%s%n", depth, width, ms, severity(ms));
         }
 
-        // ---- Part 1b: Same configs but ONLY the nested map field (no flat fields) ----
+        // ---- Test 5: Real-world recipe (for reference) ----
         System.out.println();
-        System.out.println("--- Part 1b: Map-only document (just the instructionSections field) ---");
+        System.out.println("--- Test 5: Real-world recipe structure (1 section, 1 step, 1 ingredient) ---");
         System.out.println();
 
-        for (int[] cfg : configs) {
-            int sc = cfg[0], sps = cfg[1], ips = cfg[2];
-            Value mapOnly = buildMapOnlyDocument(sc, sps, ips);
-            Value mapOnlyCopy = buildMapOnlyDocument(sc, sps, ips);
-            int totalFields = countFields(mapOnly);
-
-            long mapStart = System.nanoTime();
-            boolean eq = mapOnly.equals(mapOnlyCopy);
-            long elapsedNs = System.nanoTime() - mapStart;
-            double elapsedMs = elapsedNs / 1_000_000.0;
-
-            if (!eq) {
-                throw new AssertionError("Documents should be equal");
-            }
-
-            String severity;
-            if (elapsedMs > 10_000) severity = " *** HANG (>10s) ***";
-            else if (elapsedMs > 1_000) severity = " *** VERY SLOW (>1s) ***";
-            else if (elapsedMs > 100) severity = " * slow (>100ms) *";
-            else if (elapsedMs > 16) severity = " * noticeable (>16ms) *";
-            else severity = "";
-
-            System.out.printf(
-                "sections=%d steps=%d ingredients=%d | fields=%4d | equals(): %10.1f ms%s%n",
-                sc, sps, ips, totalFields, elapsedMs, severity
-            );
-        }
-
-        // ---- Part 2: Flat fields only (baseline) ----
-        System.out.println();
-        System.out.println("--- Part 2: Baseline -- flat fields only (no nested maps) ---");
-
-        Value flatOnly = buildFlatFieldsOnly();
-        Value flatOnlyCopy = buildFlatFieldsOnly();
-        int flatOnlyFields = countFields(flatOnly);
+        Value recipe = buildMinimalRecipe();
+        Value recipe2 = buildMinimalRecipe();
+        int fields = countFields(recipe);
+        int maps = countMapValues(recipe);
 
         long start = System.nanoTime();
-        flatOnly.equals(flatOnlyCopy);
-        double flatOnlyMs = (System.nanoTime() - start) / 1_000_000.0;
+        recipe.equals(recipe2);
+        double ms = (System.nanoTime() - start) / 1_000_000.0;
 
-        System.out.printf("  14 flat scalar fields: %.3f ms (%d fields)%n", flatOnlyMs, flatOnlyFields);
-        System.out.println();
+        System.out.printf("  fields=%d, MapValue instances=%d | %10.1f ms%s%n",
+            fields, maps, ms, severity(ms));
 
-        // ---- Part 3: JSON string workaround comparison ----
-        System.out.println("--- Part 3: JSON string workaround comparison ---");
-        System.out.println("(Using 1 section, 1 step, 1 ingredient -- the smallest possible recipe)");
-
-        Value nested = buildRecipeDocument(1, 1, 1);
-        Value nestedCopy = buildRecipeDocument(1, 1, 1);
-        int nestedFields = countFields(nested);
-
-        Value flat = buildFlatRecipeDocument(1, 1, 1);
-        Value flatCopy = buildFlatRecipeDocument(1, 1, 1);
-        int flatFields = countFields(flat);
-
-        start = System.nanoTime();
-        nested.equals(nestedCopy);
-        double nestedMs = (System.nanoTime() - start) / 1_000_000.0;
-
-        start = System.nanoTime();
-        flat.equals(flatCopy);
-        double flatMs = (System.nanoTime() - start) / 1_000_000.0;
-
-        System.out.printf("  Nested maps:         %10.1f ms (%d fields)%n", nestedMs, nestedFields);
-        System.out.printf("  JSON string:         %10.3f ms (%d fields)%n", flatMs, flatFields);
-        if (flatMs > 0) {
-            System.out.printf("  Speedup:             %,.0fx%n", nestedMs / flatMs);
-        }
-
-        // ---- Part 4: Impact summary ----
+        // ---- Summary ----
         System.out.println();
-        System.out.println("=== Impact on Firestore SDK ===");
+        System.out.println("=== Root cause ===");
         System.out.println();
-        System.out.println("View.computeDocChanges() calls this equals() on every document change.");
-        System.out.println("The Firestore SDK serializes ALL operations through a single AsyncQueue");
-        System.out.println("worker thread (FirestoreWorker). During the equals() call, ALL Firestore");
-        System.out.println("operations are blocked: reads, writes, and snapshot listeners.");
+        System.out.println("View.java:  boolean docsEqual = oldDoc.getData().equals(newDoc.getData());");
+        System.out.println("ObjectValue.java:  return buildProto().equals(((ObjectValue) o).buildProto());");
         System.out.println();
-        System.out.println("With snapshot listeners, equals() is called on both the local write");
-        System.out.println("(latency compensation) AND the server acknowledgement, so the total");
-        System.out.println("block time per mutation is 2x the single equals() time.");
-        System.out.println();
-        System.out.println("=== Root cause in Firestore SDK code ===");
-        System.out.println();
-        System.out.println("View.java line ~161:");
-        System.out.println("  boolean docsEqual = oldDoc.getData().equals(newDoc.getData());");
-        System.out.println();
-        System.out.println("ObjectValue.java line ~265:");
-        System.out.println("  return buildProto().equals(((ObjectValue) o).buildProto());");
-        System.out.println();
-        System.out.println("This calls protobuf-javalite's generated equals(), which uses");
-        System.out.println("reflection-based deep comparison (MessageSchema.equals() and");
-        System.out.println("MapFieldLite.equals()). The performance is pathological for");
+        System.out.println("This calls protobuf-javalite's MessageLite.equals(), which uses");
+        System.out.println("reflection-based deep comparison. The cost is pathological for");
         System.out.println("messages containing map<string, Value> fields.");
-        System.out.println();
-        System.out.println("PR #1920 fixed Values.java to use a custom equals() that avoids");
-        System.out.println("protobuf's native equals(), but ObjectValue.equals() still calls");
-        System.out.println("buildProto().equals() directly, bypassing the Values.java fix.");
     }
 
-    /**
-     * Build a protobuf Value representing a recipe document with deeply nested
-     * instructionSections, matching the structure that caused the Firestore hang.
-     */
-    static Value buildRecipeDocument(int numSections, int stepsPerSection, int ingredientsPerStep) {
+    /** Build nested maps: depth levels, each with `width` string fields plus one nested child. */
+    static Value buildNestedDepth(int depth, int width) {
+        // Base case: innermost map has only string fields
+        MapValue.Builder inner = MapValue.newBuilder();
+        for (int i = 0; i < width; i++) {
+            inner.putFields("f" + i, stringValue("v"));
+        }
+        Value current = Value.newBuilder().setMapValue(inner).build();
+
+        // Wrap in depth-1 more levels
+        for (int d = 1; d < depth; d++) {
+            MapValue.Builder outer = MapValue.newBuilder();
+            for (int i = 0; i < width; i++) {
+                outer.putFields("f" + i, stringValue("v"));
+            }
+            outer.putFields("child", current);
+            current = Value.newBuilder().setMapValue(outer).build();
+        }
+
+        // Wrap in root document map
+        MapValue.Builder root = MapValue.newBuilder();
+        root.putFields("data", current);
+        return Value.newBuilder().setMapValue(root).build();
+    }
+
+    /** Build a flat map with N string fields. */
+    static Value buildWideMap(int width) {
+        MapValue.Builder map = MapValue.newBuilder();
+        for (int i = 0; i < width; i++) {
+            map.putFields("field_" + i, stringValue("value_" + i));
+        }
+        return Value.newBuilder().setMapValue(map).build();
+    }
+
+    /** Build an array of N maps, each with `fieldsPerMap` string fields. */
+    static Value buildArrayOfMaps(int count, int fieldsPerMap) {
+        ArrayValue.Builder arr = ArrayValue.newBuilder();
+        for (int i = 0; i < count; i++) {
+            MapValue.Builder map = MapValue.newBuilder();
+            for (int f = 0; f < fieldsPerMap; f++) {
+                map.putFields("f" + f, stringValue("v"));
+            }
+            arr.addValues(Value.newBuilder().setMapValue(map).build());
+        }
+        MapValue.Builder root = MapValue.newBuilder();
+        root.putFields("items", Value.newBuilder().setArrayValue(arr).build());
+        return Value.newBuilder().setMapValue(root).build();
+    }
+
+    /** Minimal recipe: 1 section, 1 step, 1 ingredient (with alternates). */
+    static Value buildMinimalRecipe() {
         MapValue.Builder doc = MapValue.newBuilder();
+        doc.putFields("name", stringValue("Test Recipe"));
 
-        // Flat scalar fields
-        doc.putFields("name", stringValue("Grandma's Famous Chocolate Chip Cookies"));
-        doc.putFields("sourceUrl", stringValue("https://example.com/recipe/123"));
-        doc.putFields("story", stringValue("This recipe has been in our family for generations..."));
-        doc.putFields("imageUrl", stringValue("https://example.com/images/cookies.jpg"));
-        doc.putFields("sourceImageUrl", stringValue("https://example.com/images/cookies-original.jpg"));
-        doc.putFields("servings", intValue(24));
-        doc.putFields("prepTime", stringValue("PT20M"));
-        doc.putFields("cookTime", stringValue("PT12M"));
-        doc.putFields("totalTime", stringValue("PT32M"));
-        doc.putFields("isFavorite", boolValue(true));
-        doc.putFields("createdAt", intValue(1708000000));
-        doc.putFields("updatedAt", intValue(1708100000));
-        doc.putFields("tags", arrayOfStrings("dessert", "cookies", "baking", "chocolate"));
-        doc.putFields("equipment", arrayOfStrings("mixing bowl", "baking sheet", "wire rack", "stand mixer"));
+        // ingredient with amount and alternates
+        MapValue.Builder altAmount = MapValue.newBuilder();
+        altAmount.putFields("value", Value.newBuilder().setDoubleValue(3.0).build());
+        altAmount.putFields("unit", stringValue("tbsp"));
 
-        // instructionSections -- the deeply nested field that causes the hang
-        ArrayValue.Builder sections = ArrayValue.newBuilder();
-        for (int s = 0; s < numSections; s++) {
-            sections.addValues(Value.newBuilder()
-                .setMapValue(buildInstructionSection("Section " + (s + 1), stepsPerSection, ingredientsPerStep))
-                .build());
-        }
-        doc.putFields("instructionSections", Value.newBuilder().setArrayValue(sections).build());
+        MapValue.Builder alt = MapValue.newBuilder();
+        alt.putFields("name", stringValue("Alt"));
+        alt.putFields("amount", Value.newBuilder().setMapValue(altAmount).build());
 
-        return Value.newBuilder().setMapValue(doc).build();
-    }
-
-    /** Build a document with ONLY the instructionSections field (no flat scalar fields). */
-    static Value buildMapOnlyDocument(int numSections, int stepsPerSection, int ingredientsPerStep) {
-        MapValue.Builder doc = MapValue.newBuilder();
-        ArrayValue.Builder sections = ArrayValue.newBuilder();
-        for (int s = 0; s < numSections; s++) {
-            sections.addValues(Value.newBuilder()
-                .setMapValue(buildInstructionSection("Section " + (s + 1), stepsPerSection, ingredientsPerStep))
-                .build());
-        }
-        doc.putFields("instructionSections", Value.newBuilder().setArrayValue(sections).build());
-        return Value.newBuilder().setMapValue(doc).build();
-    }
-
-    /** Build a document with only flat scalar fields (no nested maps). */
-    static Value buildFlatFieldsOnly() {
-        MapValue.Builder doc = MapValue.newBuilder();
-        doc.putFields("name", stringValue("Grandma's Famous Chocolate Chip Cookies"));
-        doc.putFields("sourceUrl", stringValue("https://example.com/recipe/123"));
-        doc.putFields("story", stringValue("This recipe has been in our family for generations..."));
-        doc.putFields("imageUrl", stringValue("https://example.com/images/cookies.jpg"));
-        doc.putFields("sourceImageUrl", stringValue("https://example.com/images/cookies-original.jpg"));
-        doc.putFields("servings", intValue(24));
-        doc.putFields("prepTime", stringValue("PT20M"));
-        doc.putFields("cookTime", stringValue("PT12M"));
-        doc.putFields("totalTime", stringValue("PT32M"));
-        doc.putFields("isFavorite", boolValue(true));
-        doc.putFields("createdAt", intValue(1708000000));
-        doc.putFields("updatedAt", intValue(1708100000));
-        doc.putFields("tags", arrayOfStrings("dessert", "cookies", "baking", "chocolate"));
-        doc.putFields("equipment", arrayOfStrings("mixing bowl", "baking sheet", "wire rack", "stand mixer"));
-        return Value.newBuilder().setMapValue(doc).build();
-    }
-
-    /**
-     * Build a "flat" recipe where instructionSections is stored as a JSON string
-     * instead of nested maps. This is the workaround.
-     */
-    static Value buildFlatRecipeDocument(int numSections, int stepsPerSection, int ingredientsPerStep) {
-        MapValue.Builder doc = MapValue.newBuilder();
-        doc.putFields("name", stringValue("Grandma's Famous Chocolate Chip Cookies"));
-        doc.putFields("sourceUrl", stringValue("https://example.com/recipe/123"));
-        doc.putFields("story", stringValue("This recipe has been in our family for generations..."));
-        doc.putFields("imageUrl", stringValue("https://example.com/images/cookies.jpg"));
-        doc.putFields("sourceImageUrl", stringValue("https://example.com/images/cookies-original.jpg"));
-        doc.putFields("servings", intValue(24));
-        doc.putFields("prepTime", stringValue("PT20M"));
-        doc.putFields("cookTime", stringValue("PT12M"));
-        doc.putFields("totalTime", stringValue("PT32M"));
-        doc.putFields("isFavorite", boolValue(true));
-        doc.putFields("createdAt", intValue(1708000000));
-        doc.putFields("updatedAt", intValue(1708100000));
-        doc.putFields("tags", arrayOfStrings("dessert", "cookies", "baking", "chocolate"));
-        doc.putFields("equipment", arrayOfStrings("mixing bowl", "baking sheet", "wire rack", "stand mixer"));
-
-        // instructionSections as a JSON string -- the workaround
-        StringBuilder json = new StringBuilder("[");
-        for (int s = 0; s < numSections; s++) {
-            if (s > 0) json.append(",");
-            json.append(buildInstructionSectionJson("Section " + (s + 1), stepsPerSection, ingredientsPerStep));
-        }
-        json.append("]");
-        doc.putFields("instructionSectionsJson", stringValue(json.toString()));
-
-        return Value.newBuilder().setMapValue(doc).build();
-    }
-
-    static MapValue buildInstructionSection(String name, int numSteps, int ingredientsPerStep) {
-        MapValue.Builder section = MapValue.newBuilder();
-        section.putFields("name", stringValue(name));
-
-        ArrayValue.Builder steps = ArrayValue.newBuilder();
-        for (int i = 0; i < numSteps; i++) {
-            steps.addValues(Value.newBuilder()
-                .setMapValue(buildStep(i + 1, ingredientsPerStep))
-                .build());
-        }
-        section.putFields("steps", Value.newBuilder().setArrayValue(steps).build());
-        return section.build();
-    }
-
-    static MapValue buildStep(int stepNumber, int numIngredients) {
-        MapValue.Builder step = MapValue.newBuilder();
-        step.putFields("stepNumber", intValue(stepNumber));
-        step.putFields("instruction", stringValue(
-            "Mix the dry ingredients together in a large bowl. " +
-            "Combine flour, baking soda, and salt. Set aside."));
-        step.putFields("yields", intValue(1));
-        step.putFields("optional", boolValue(false));
-
-        ArrayValue.Builder ingredients = ArrayValue.newBuilder();
-        for (int i = 0; i < numIngredients; i++) {
-            ingredients.addValues(Value.newBuilder()
-                .setMapValue(buildIngredient("Ingredient " + (i + 1), i % 3 == 0))
-                .build());
-        }
-        step.putFields("ingredients", Value.newBuilder().setArrayValue(ingredients).build());
-        return step.build();
-    }
-
-    static MapValue buildIngredient(String name, boolean withAlternates) {
-        MapValue.Builder ingredient = MapValue.newBuilder();
-        ingredient.putFields("name", stringValue(name));
-        ingredient.putFields("notes", stringValue("finely chopped"));
-        ingredient.putFields("optional", boolValue(false));
-        ingredient.putFields("density", Value.newBuilder().setDoubleValue(1.05).build());
-
-        // Amount (nested map)
         MapValue.Builder amount = MapValue.newBuilder();
         amount.putFields("value", Value.newBuilder().setDoubleValue(2.5).build());
         amount.putFields("unit", stringValue("cups"));
+
+        MapValue.Builder ingredient = MapValue.newBuilder();
+        ingredient.putFields("name", stringValue("Flour"));
         ingredient.putFields("amount", Value.newBuilder().setMapValue(amount).build());
+        ingredient.putFields("alternates", Value.newBuilder().setArrayValue(
+            ArrayValue.newBuilder().addValues(Value.newBuilder().setMapValue(alt).build())
+        ).build());
 
-        // Alternates -- recursive nesting (the most problematic part)
-        if (withAlternates) {
-            ArrayValue.Builder alternates = ArrayValue.newBuilder();
-            for (int i = 0; i < 2; i++) {
-                MapValue.Builder alt = MapValue.newBuilder();
-                alt.putFields("name", stringValue("Alternate " + (i + 1)));
-                alt.putFields("notes", stringValue("can substitute"));
-                alt.putFields("optional", boolValue(true));
-                alt.putFields("density", Value.newBuilder().setDoubleValue(0.95).build());
+        MapValue.Builder step = MapValue.newBuilder();
+        step.putFields("instruction", stringValue("Mix"));
+        step.putFields("ingredients", Value.newBuilder().setArrayValue(
+            ArrayValue.newBuilder().addValues(Value.newBuilder().setMapValue(ingredient).build())
+        ).build());
 
-                MapValue.Builder altAmount = MapValue.newBuilder();
-                altAmount.putFields("value", Value.newBuilder().setDoubleValue(3.0).build());
-                altAmount.putFields("unit", stringValue("tablespoons"));
-                alt.putFields("amount", Value.newBuilder().setMapValue(altAmount).build());
+        MapValue.Builder section = MapValue.newBuilder();
+        section.putFields("steps", Value.newBuilder().setArrayValue(
+            ArrayValue.newBuilder().addValues(Value.newBuilder().setMapValue(step).build())
+        ).build());
 
-                alt.putFields("alternates", Value.newBuilder()
-                    .setArrayValue(ArrayValue.newBuilder()).build());
+        doc.putFields("instructionSections", Value.newBuilder().setArrayValue(
+            ArrayValue.newBuilder().addValues(Value.newBuilder().setMapValue(section).build())
+        ).build());
 
-                alternates.addValues(Value.newBuilder().setMapValue(alt).build());
-            }
-            ingredient.putFields("alternates", Value.newBuilder().setArrayValue(alternates).build());
-        } else {
-            ingredient.putFields("alternates", Value.newBuilder()
-                .setArrayValue(ArrayValue.newBuilder()).build());
-        }
-
-        return ingredient.build();
+        return Value.newBuilder().setMapValue(doc).build();
     }
 
-    static String buildInstructionSectionJson(String name, int numSteps, int ingredientsPerStep) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("{\"name\":\"").append(name).append("\",\"steps\":[");
-        for (int i = 0; i < numSteps; i++) {
-            if (i > 0) sb.append(",");
-            sb.append(buildStepJson(i + 1, ingredientsPerStep));
-        }
-        sb.append("]}");
-        return sb.toString();
+    static String severity(double ms) {
+        if (ms > 10_000) return " *** HANG (>10s) ***";
+        if (ms > 1_000) return " *** VERY SLOW (>1s) ***";
+        if (ms > 100) return " * slow (>100ms) *";
+        if (ms > 16) return " * noticeable (>16ms) *";
+        return "";
     }
 
-    static String buildStepJson(int stepNumber, int numIngredients) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("{\"stepNumber\":").append(stepNumber)
-          .append(",\"instruction\":\"Mix the dry ingredients together in a large bowl.\",")
-          .append("\"yields\":1,\"optional\":false,\"ingredients\":[");
-        for (int i = 0; i < numIngredients; i++) {
-            if (i > 0) sb.append(",");
-            sb.append(buildIngredientJson("Ingredient " + (i + 1), i % 3 == 0));
-        }
-        sb.append("]}");
-        return sb.toString();
-    }
-
-    static String buildIngredientJson(String name, boolean withAlternates) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("{\"name\":\"").append(name).append("\",")
-          .append("\"notes\":\"finely chopped\",\"optional\":false,\"density\":1.05,")
-          .append("\"amount\":{\"value\":2.5,\"unit\":\"cups\"},");
-        if (withAlternates) {
-            sb.append("\"alternates\":[")
-              .append("{\"name\":\"Alt 1\",\"notes\":\"sub\",\"optional\":true,\"density\":0.95,")
-              .append("\"amount\":{\"value\":3.0,\"unit\":\"tbsp\"},\"alternates\":[]},")
-              .append("{\"name\":\"Alt 2\",\"notes\":\"sub\",\"optional\":true,\"density\":0.95,")
-              .append("\"amount\":{\"value\":3.0,\"unit\":\"tbsp\"},\"alternates\":[]}")
-              .append("]");
-        } else {
-            sb.append("\"alternates\":[]");
-        }
-        sb.append("}");
-        return sb.toString();
-    }
-
-    /** Count total protobuf fields recursively to quantify document complexity. */
     static int countFields(Value value) {
         switch (value.getValueTypeCase()) {
             case MAP_VALUE:
@@ -435,6 +270,25 @@ public class FirestoreMapHangRepro {
         }
     }
 
+    static int countMapValues(Value value) {
+        switch (value.getValueTypeCase()) {
+            case MAP_VALUE:
+                int count = 1;
+                for (Value v : value.getMapValue().getFieldsMap().values()) {
+                    count += countMapValues(v);
+                }
+                return count;
+            case ARRAY_VALUE:
+                int arrayCount = 0;
+                for (Value v : value.getArrayValue().getValuesList()) {
+                    arrayCount += countMapValues(v);
+                }
+                return arrayCount;
+            default:
+                return 0;
+        }
+    }
+
     static Value stringValue(String s) {
         return Value.newBuilder().setStringValue(s).build();
     }
@@ -445,13 +299,5 @@ public class FirestoreMapHangRepro {
 
     static Value boolValue(boolean b) {
         return Value.newBuilder().setBooleanValue(b).build();
-    }
-
-    static Value arrayOfStrings(String... values) {
-        ArrayValue.Builder arr = ArrayValue.newBuilder();
-        for (String s : values) {
-            arr.addValues(stringValue(s));
-        }
-        return Value.newBuilder().setArrayValue(arr).build();
     }
 }
